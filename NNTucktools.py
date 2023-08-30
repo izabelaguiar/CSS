@@ -11,7 +11,6 @@ from math import sqrt
 import numpy as np
 import warnings
 import copy
-import scipy
 tl.set_backend('numpy')
 
 def max_like(tensor, core, factors, masked = False, M = None):
@@ -29,30 +28,6 @@ def KL_D(tensor, core, factors, masked = False, M = None):
     B_p = copy.deepcopy(B)
     B_p[np.where(B<1e-6)] = 1e-6
     return np.sum(np.where(mask, tensor*np.log(tensor/B_p, where=mask) -tensor +B, 0))+np.sum(np.where(tensor==0, B, 0))
-
-def LRT(tensor, full_NNTuck, nested_NNTuck, Type = 'redundant', Masked = False, M = None):
-    LRT_types = ['redundant', 'independent', 'dependent']
-    if Type not in LRT_types:
-        print('Type must be one of', LRT_types)
-        return
-    full_core, full_factors = full_NNTuck
-    C, K, K = np.shape(full_core)
-    L, _ = np.shape(full_factors[2])
-    full_ll = max_like(tensor, full_core, full_factors, Masked, M)
-    
-    nested_core, nested_factors = nested_NNTuck
-    C_n, _, _ = np.shape(nested_core)
-    nested_ll = max_like(tensor, nested_core, nested_factors, Masked, M)
-    if Type == 'redundant':
-        deg = (L-1)*K*K
-    elif Type == 'independent':
-        deg = (L-C)*K*K - L*C
-    elif Type == 'dependent':
-        deg = (L+K*K)*(C-C_n)
-    LR_statistic = -2*(nested_ll-full_ll)
-    pval = scipy.stats.chi2.sf(LR_statistic, deg)
-    print('p-value of layer {} test is {}'.format(Type, pval))
-    return (pval, full_ll, nested_ll)
 
 def GenerateSBM(N, G1, Omega, TYPE, G2, theta = None, undirected =  True, Poisson = True, unweighted = True):
     '''
@@ -190,7 +165,6 @@ def non_negative_tucker(tensor, rank, n_iter_max=10, init='svd', tol=10e-5, MT_s
         EM_count = 0;
     epsilon = 10e-12
     I_l = np.shape(tensor)[0]
-    tensor = copy.deepcopy(tensor)
     
     if masked:
         tensor = M * tensor # hereafter, everytime 'tensor' is referenced, it'll only be the observed entries.
@@ -262,20 +236,13 @@ def non_negative_tucker(tensor, rank, n_iter_max=10, init='svd', tol=10e-5, MT_s
         else:
             rec_error = tl.norm(tensor - M * tucker_to_tensor((nn_core, nn_factors)), 2) / norm_tensor
         rec_errors.append(rec_error)
+    if rec_errors[0]<tol:
+        print('{} loss is {} upon initialization. Already converged.'.format(loss, rec_errors[0]))
+        return nn_core, nn_factors
     if not masked:
         EM_errors.append(max_like(tensor, nn_core, nn_factors))
     else:
         EM_errors.append(max_like(tensor, nn_core, nn_factors, masked, M))
-    if rec_errors[0]<tol:
-        print('{} loss is {} upon initialization. Already converged.'.format(loss, rec_errors[0]))
-        if not returnErrors:
-            return TuckerTensor((nn_core, nn_factors))
-        else:
-            if return_fact_it:
-                return TuckerTensor((nn_core, nn_factors)), EM_errors, rec_errors, facts
-            else:
-                return TuckerTensor((nn_core, nn_factors)), EM_errors, rec_errors 
-        return nn_core, nn_factors
         
     for iteration in range(n_iter_max):
 
@@ -283,7 +250,7 @@ def non_negative_tucker(tensor, rank, n_iter_max=10, init='svd', tol=10e-5, MT_s
             I_n = np.shape(tensor)[mode]
             if constrained and mode==0:
                 nn_factors[mode] = np.eye(I_n)
-            elif (not symmetric) or (symmetric and mode == 1): 
+            elif (not symmetric) or (symmetric and mode != 2): 
                 if loss == 'KL':
                     B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
                     B = unfold(B, mode)
@@ -333,10 +300,9 @@ def non_negative_tucker(tensor, rank, n_iter_max=10, init='svd', tol=10e-5, MT_s
             denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
         
         mul_update = numerator / denominator
-        nn_core *= numerator / denominator
         if symmetric and iteration %50 ==0 and verbose:
             print('It is {} that mul_update[0] is symmetric at iteration {}'.format(np.allclose(mul_update[0], mul_update[0].T), iteration))
-            print('And it is {} that core[0] is symmetric at iteration {}'.format(np.allclose(nn_core[0], nn_core[0].T), iteration))
+        nn_core *= numerator / denominator
         
         if return_fact_it:
             facts.append((copy.deepcopy(nn_core), copy.deepcopy(nn_factors)))
@@ -359,14 +325,6 @@ def non_negative_tucker(tensor, rank, n_iter_max=10, init='svd', tol=10e-5, MT_s
                 rec_errors[-1], rec_errors[-2] - rec_errors[-1]))
             
         if iteration > 0 and rec_errors[-1]>rec_errors[-2]:
-            if np.any(nn_core < 0):
-                print("core tensor is negative")
-            if np.any(nn_factors[0]<0):
-                print("Y is negative")
-            if np.any(nn_factors[1]<0):
-                print("U is negative")
-            if np.any(nn_factors[2]<0):
-                print("V is negative")
             print("ERROR: Loss increasing at iteration ", iteration)
         
         if not MT_stopping_conditions:
@@ -616,29 +574,472 @@ def non_negative_tucker_ones(tensor, rank, n_iter_max=10, init='svd', tol=10e-5,
         else:
             return TuckerTensor((nn_core, nn_factors)), EM_errors, rec_errors
         
-def Y_interp(factors, ystar = False, r_star = None):
+def Y_interp(factors, r_star = None, verbose = False):
     Y = factors[0]
     ALPHA, C = np.shape(Y)
-    if ystar:
-        Y_star = np.zeros_like(Y)
-        r_bar = [r for r in range(ALPHA) if r not in r_star]
-        Y_rstar = Y[r_star, :]
-        Y_rbar = Y[r_bar, :]
-        Y_star[r_star, :] = np.eye(C)
-        Y_star[r_bar, :] = np.linalg.solve(Y_rstar.T, Y_rbar.T).T
-    Y_2norm = Y/np.linalg.norm(Y, axis = 1, keepdims = True)
-    plt.imshow(Y_2norm@Y_2norm.T, cmap = 'binary')
-    with np.printoptions(precision = 4, suppress=True):
-        print("True Y is ")
-        print("")
-        print(Y)
-        print("")
-        print("Y_norm is")
-        print("")
-        print(Y/np.sum(Y, axis = 1, keepdims = True))
-        print("")
-        if ystar:
+    
+    Y_star = np.zeros_like(Y)
+    r_bar = [r for r in range(ALPHA) if r not in r_star]
+    Y_rstar = Y[r_star, :]
+    Y_rbar = Y[r_bar, :]
+    Y_star[r_star, :] = np.eye(C)
+    Y_star[r_bar, :] = np.linalg.solve(Y_rstar.T, Y_rbar.T).T
+    
+    if verbose:
+        with np.printoptions(precision = 4, suppress=True):
+            print("True Y is ")
+            print("")
+            print(Y)
+            print("")
+            print("Y_norm is")
+            print("")
+            print(Y/np.sum(Y, axis = 1, keepdims = True))
+            print("")
             print("row normalized Y_star is")
             print("")
             print(Y_star/np.sum(abs(Y_star), axis = 1, keepdims = True))
             print("")
+                
+    return Y_star/np.sum(abs(Y_star), axis = 1, keepdims = True)
+
+            
+            
+def non_negative_tucker_SCagreement(tensor, rank, n_iter_max=10, init='svd', tol=10e-5, 
+                                    MT_stopping_conditions = False, symmetric = False, socog = False,
+                        random_state=None, verbose=False, loss = 'KL', constrained=False, 
+                                    init_core =None, init_factors =None, averaged = False, avg_mult = False,
+                        returnErrors = False, return_fact_it = False, masked = False, Masking = None):
+    """Non-negative Tucker decomposition
+        Iterative multiplicative update, see [2]
+        Updated 9/3/23 by Iz to include option for multiplicative updates for SC agreement
+        
+        - Need to store different decompositions along the way
+            - Store one decomposition, replace it with the current one if the KL divergence is lower
+        - Need to have different stopping conditions
+        - Need to save the KL divergence over each update. 
+        - Decide how to do U=Y constraint
+            - Option 1: only update U, copy it into Y
+            - Option 2: Update U, copy it into Y, update Y, copy it into U
+            - Option 3: Update U and Y separately each time until convergence, 
+                - 3a: then set U & Y to be the average of the two
+                - 3b: then set U & Y to be either U or Y, depending on which KL is lower
+                - 3c: ?
+            
+    Parameters
+    ----------
+    tensor : ``ndarray``
+    rank : None, int or int list
+        size of the core tensor, ``(len(ranks) == tensor.ndim)``
+        if int, the same rank is used for all modes
+    n_iter_max : int
+        maximum number of iteration
+    init : {'svd', 'random'}
+    tol : stopping conditions
+    MT_stopping_conditions : {True, False}
+        if True, uses the stopping conditions from MULTITENSOR paper.          ### REMOVE IF PUSHING TO TENSORLY ###
+    symmetric : {True, False}
+        if True, enforces U=V          ### REMOVE IF PUSHING TO TENSORLY ###
+    socog: {True, False}
+        if True, enforces U = Y
+    random_state : {None, int, np.random.RandomState}
+    verbose : int , optional
+        level of verbosity
+    loss : string, optional
+        Which multiplicative update to use. 'KL' or 'LS'.
+    ranks : None or int list
+    size of the core tensor
+    Returns
+    -------
+    core : ndarray
+            positive core of the Tucker decomposition
+            has shape `ranks`
+    factors : ndarray list
+            list of factors of the CP decomposition
+            element `i` is of shape ``(tensor.shape[i], rank)``
+    References
+    ----------
+    .. [2] Yong-Deok Kim and Seungjin Choi,
+       "Non-negative tucker decomposition",
+       IEEE Conference on Computer Vision and Pattern Recognition s(CVPR),
+       pp 1-8, 2007
+    """
+    M = Masking #just to help notation
+    rank = validate_tucker_rank(tl.shape(tensor), rank=rank)
+    if loss != 'KL' and loss != 'LS':
+        print('loss must be one of KL or LS')
+        return
+    if socog:
+        assert rank[0] == rank[1], "For social-cognitive agreement, C must equal K."
+    if MT_stopping_conditions:
+        EM_count = 0;
+    epsilon = 10e-12
+    I_l = np.shape(tensor)[0]
+    tensor = copy.deepcopy(tensor)
+    
+    if masked:
+        tensor = M * tensor # hereafter, everytime 'tensor' is referenced, it'll only be the observed entries.
+        #then we don't have to change the numerator for any of the updates at all. 
+        M_unfold = []
+        for mode in range(tl.ndim(tensor)):
+            M_unfold.append(unfold(M, mode))
+                
+    # Initialisation
+    if init == 'svd':
+        core, factors = tucker(tensor, rank)
+        nn_factors = [tl.abs(f) for f in factors]
+        if constrained: nn_factors[0] = np.eye(I_l)
+            # ADDING THIS PART FOR SOCIAL COGNITIVE AGREEMENT
+        if socog: 
+            nn_factors[1] = copy.deepcopy(nn_factors[0])
+        if symmetric: nn_factors[2] = copy.deepcopy(nn_factors[1])
+        if symmetric and np.allclose(nn_factors[2], nn_factors[1]) and verbose: 
+            print('yay, U==V')
+        elif symmetric and not np.allclose(nn_factors[2], nn_factors[1]) and verbose:
+            print('oh no, U!=V')
+        nn_core = tl.abs(core)
+    if init == 'custom':
+        if init_core is None or init_factors is None:
+            print('ERROR: For custom initialization, must provide init_core and init_factors')
+            return
+        else:
+            nn_core = copy.deepcopy(init_core)
+            nn_factors = copy.deepcopy(init_factors)
+            #print('init factors[0] is {}'.format(init_factors[0]))
+        if constrained: 
+            nn_factors[0] = np.eye(I_l)
+            print('doing constrained')
+        # ADDING THIS PART FOR SOCIAL COGNITIVE AGREEMENT
+        if socog: 
+            nn_factors[1] = copy.deepcopy(nn_factors[0])
+        if symmetric: nn_factors[2] = copy.deepcopy(nn_factors[1])
+        if symmetric and np.allclose(nn_factors[2], nn_factors[1]) and verbose: 
+            print('yay, U==V')
+        elif symmetric and not np.allclose(nn_factors[2], nn_factors[1]) and verbose:
+            print('oh no, U!=V')
+    else:
+        rng = check_random_state(random_state)
+        core = tl.tensor(rng.random_sample(rank) + 0.01, **tl.context(tensor))  
+        factors = [tl.tensor(rng.random_sample(s), **tl.context(tensor)) for s in zip(tl.shape(tensor), rank)]
+        nn_factors = [tl.abs(f) for f in factors]
+        if constrained: 
+            nn_factors[0] = np.eye(I_l)
+        # ADDING THIS PART FOR SOCIAL COGNITIVE AGREEMENT
+        if socog: 
+            nn_factors[1] = copy.deepcopy(nn_factors[0])
+        if symmetric: nn_factors[2] = copy.deepcopy(nn_factors[1])
+        if symmetric and np.allclose(nn_factors[2], nn_factors[1]) and verbose: 
+            print('yay, U==V')
+        elif symmetric and not np.allclose(nn_factors[2], nn_factors[1]):
+            print('oh no, U!=V')
+        nn_core = tl.abs(core)
+    if symmetric:
+        for alpha in range(rank[0]):
+            nn_core[alpha ,:, :] = nn_core[alpha ,:, :]@nn_core[alpha ,:, :].T
+            if np.allclose(nn_core[alpha ,:, :],nn_core[alpha ,:, :].T) and verbose:
+                print('yay, core is now symmetric')
+
+    norm_tensor = tl.norm(tensor, 2)
+    rec_errors = []
+    update_errors = []
+    EM_errors = []
+    if return_fact_it:
+        facts = []
+        facts.append((copy.deepcopy(nn_core), copy.deepcopy(nn_factors)))
+    if loss == 'KL':
+        if not masked:
+            rec_errors.append(KL_D(tensor, nn_core, nn_factors))
+            update_errors.append(KL_D(tensor, nn_core, nn_factors))
+        else:
+            rec_errors.append(KL_D(tensor, nn_core, nn_factors, masked, M))
+            update_errors.append(KL_D(tensor, nn_core, nn_factors, masked, M))
+    else: 
+        if not masked:
+            rec_error = tl.norm(tensor - tucker_to_tensor((nn_core, nn_factors)), 2) / norm_tensor
+        else:
+            rec_error = tl.norm(tensor - M * tucker_to_tensor((nn_core, nn_factors)), 2) / norm_tensor
+        rec_errors.append(rec_error)
+        update_errors.append(rec_error)
+    if not masked:
+        EM_errors.append(max_like(tensor, nn_core, nn_factors))
+    else:
+        EM_errors.append(max_like(tensor, nn_core, nn_factors, masked, M))
+    if rec_errors[0]<tol:
+        print('{} loss is {} upon initialization. Already converged.'.format(loss, rec_errors[0]))
+        if not returnErrors:
+            return TuckerTensor((nn_core, nn_factors))
+        else:
+            if return_fact_it:
+                return TuckerTensor((nn_core, nn_factors)), EM_errors, rec_errors, facts
+            else:
+                return TuckerTensor((nn_core, nn_factors)), EM_errors, rec_errors 
+        return nn_core, nn_factors
+    
+    #*********** MAKE A VAR FOR THE DECOMPOSITION WITH LOWEST KL DIVERGENCE *************#
+    
+    nn_min_core = copy.deepcopy(nn_core)
+    nn_min_factors = copy.deepcopy(nn_factors)
+    nn_min_KL = rec_errors[0]
+    
+    #*********** FACTOR UPDATES *************#
+    for iteration in range(n_iter_max):
+
+        for mode in range(tl.ndim(tensor)):
+            I_n = np.shape(tensor)[mode]
+            if constrained and mode==0:
+                nn_factors[mode] = np.eye(I_n)
+                
+            ### SYMMETRIC AND SOCOG ###
+            if symmetric and socog and not (averaged or avg_mult): 
+                if loss == 'KL':
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = unfold(B, mode)
+                    numerator = unfold(tensor, mode)
+                    numerator = numerator / tl.clip(tl.dot(nn_factors[mode], B), a_min=epsilon, a_max=None)
+                    numerator = tl.dot(numerator, tl.transpose(B))
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    if not masked:
+                        z = np.sum(B, axis=1)
+                        denominator = np.outer(np.ones(I_n), z)
+                    else:
+                        denominator = tl.dot(M_unfold[mode],tl.transpose(B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                else: #haven't "masked" this.
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = tl.transpose(unfold(B, mode))
+                    numerator = tl.dot(unfold(tensor, mode), B)
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    denominator = tl.dot(nn_factors[mode], tl.dot(tl.transpose(B), B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                    
+                # this multiplicative update is specific to the current mode, but it is used to update all the factors
+                mult_update = numerator / denominator    
+                nn_factors[0] *= mult_update
+                nn_factors[1] *= mult_update
+                nn_factors[2] *= mult_update
+                update_errors.append(KL_D(tensor, nn_core, nn_factors))
+                    
+            ### NOT SYMMETRIC, NOT SOCOG, OR SYMMETRIC, NOT SOCOG, MODE 1 or 0  (updates Y and U)      
+            elif not socog and (not symmetric or (symmetric and mode != 2)): 
+                if loss == 'KL':
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = unfold(B, mode)
+                    numerator = unfold(tensor, mode)
+                    numerator = numerator / tl.clip(tl.dot(nn_factors[mode], B), a_min=epsilon, a_max=None)
+                    numerator = tl.dot(numerator, tl.transpose(B))
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    if not masked:
+                        z = np.sum(B, axis=1)
+                        denominator = np.outer(np.ones(I_n), z)
+                    else:
+                        denominator = tl.dot(M_unfold[mode],tl.transpose(B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                else: #haven't "masked" this.
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = tl.transpose(unfold(B, mode))
+                    numerator = tl.dot(unfold(tensor, mode), B)
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    denominator = tl.dot(nn_factors[mode], tl.dot(tl.transpose(B), B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                
+                nn_factors[mode] *= numerator / denominator
+                if symmetric and mode == 1:
+                    nn_factors[2] *= numerator / denominator
+                update_errors.append(KL_D(tensor, nn_core, nn_factors))
+                    
+            ### NOT SYMMETRIC, YES SOCOG, MODE !=1    
+            elif (socog and not symmetric and not (averaged or avg_mult)): 
+                mode = 2 - mode #new line
+                if loss == 'KL':
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = unfold(B, mode)
+                    numerator = unfold(tensor, mode)
+                    numerator = numerator / tl.clip(tl.dot(nn_factors[mode], B), a_min=epsilon, a_max=None)
+                    numerator = tl.dot(numerator, tl.transpose(B))
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    if not masked:
+                        z = np.sum(B, axis=1)
+                        denominator = np.outer(np.ones(I_n), z)
+                    else:
+                        denominator = tl.dot(M_unfold[mode],tl.transpose(B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                else: #haven't "masked" this.
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = tl.transpose(unfold(B, mode))
+                    numerator = tl.dot(unfold(tensor, mode), B)
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    denominator = tl.dot(nn_factors[mode], tl.dot(tl.transpose(B), B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                # mult_update is specific to the mode we're in.
+                mult_update = numerator / denominator
+                nn_factors[mode] *= mult_update
+                # if we're updating either U or Y, then update the other. 
+                    # Y: mode = 0, update mode 1
+                    # U: mode = 1, update mode 0
+                if mode == 1 or mode ==0:
+                    nn_factors[1-mode] *= mult_update
+                update_errors.append(KL_D(tensor, nn_core, nn_factors))
+                
+            ### NOT SYMMETRIC, YES SOCOG, UPDATES ALL, AVERAGES U AND Y     
+            elif (socog and not symmetric and averaged): 
+                mode = 2 - mode #new line
+                if loss == 'KL':
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = unfold(B, mode)
+                    numerator = unfold(tensor, mode)
+                    numerator = numerator / tl.clip(tl.dot(nn_factors[mode], B), a_min=epsilon, a_max=None)
+                    numerator = tl.dot(numerator, tl.transpose(B))
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    if not masked:
+                        z = np.sum(B, axis=1)
+                        denominator = np.outer(np.ones(I_n), z)
+                    else:
+                        denominator = tl.dot(M_unfold[mode],tl.transpose(B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                else: #haven't "masked" this.
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = tl.transpose(unfold(B, mode))
+                    numerator = tl.dot(unfold(tensor, mode), B)
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    denominator = tl.dot(nn_factors[mode], tl.dot(tl.transpose(B), B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                
+                nn_factors[mode] *= numerator / denominator
+                #change back below line after test to mode ==1
+                if mode == 0: # after Y and U have been updated, re-constrain U = Y to be equal
+                    avg = .5*(nn_factors[0] + nn_factors[1])
+                    nn_factors[0] = copy.deepcopy(avg)
+                    nn_factors[1] = copy.deepcopy(avg)
+                update_errors.append(KL_D(tensor, nn_core, nn_factors))
+                
+            ### NOT SYMMETRIC, YES SOCOG, UPDATES ALL, uses mult AVERAGE to update U AND Y   
+            elif (socog and not symmetric and avg_mult): 
+                mode = 2 - mode #new line
+                if loss == 'KL':
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = unfold(B, mode)
+                    numerator = unfold(tensor, mode)
+                    numerator = numerator / tl.clip(tl.dot(nn_factors[mode], B), a_min=epsilon, a_max=None)
+                    numerator = tl.dot(numerator, tl.transpose(B))
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    if not masked:
+                        z = np.sum(B, axis=1)
+                        denominator = np.outer(np.ones(I_n), z)
+                    else:
+                        denominator = tl.dot(M_unfold[mode],tl.transpose(B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                else: #haven't "masked" this.
+                    B = tucker_to_tensor((nn_core, nn_factors), skip_factor=mode)
+                    B = tl.transpose(unfold(B, mode))
+                    numerator = tl.dot(unfold(tensor, mode), B)
+                    numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+                    denominator = tl.dot(nn_factors[mode], tl.dot(tl.transpose(B), B))
+                    denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+                if mode == 0:
+                    Y_mult = numerator / denominator
+                    #print('updated Y_mult, first digit is {}'.format(Y_mult[0,0]))
+                elif mode == 1:
+                    U_mult = numerator / denominator
+                    #print('updated U_mult, first digit is {}'.format(U_mult[0,0]))
+                elif mode== 2:    
+                    nn_factors[mode] *= numerator / denominator
+                #change back below line after test to mode ==1
+                if mode == 0: # after mult updates for Y and U have been found,update both U and Y with avg
+                    a_mult = .5*(Y_mult + U_mult)
+                    #print('using Y_mult {} and U_mult {}'.format(Y_mult[0,0], U_mult[0,0]))
+                    nn_factors[0] *= a_mult
+                    nn_factors[1] *= a_mult
+                update_errors.append(KL_D(tensor, nn_core, nn_factors))
+
+        if symmetric and iteration %50 ==0 and verbose: 
+            print('It is {} at iteration {} that , U==V'.format(np.allclose(nn_factors[2], nn_factors[1]), iteration))
+         
+        if socog and iteration %50 ==0 and verbose: 
+            print('It is {} at iteration {} that , Y==U'.format(np.allclose(nn_factors[0], nn_factors[1]), iteration))
+        
+        ##### NOW UPDATING CORE ##### 
+        if loss == 'KL':
+            X_hat = tucker_to_tensor((nn_core, nn_factors), transpose_factors= False)
+            X_hat = tl.clip(X_hat, a_min = epsilon, a_max = None)
+            numerator = tucker_to_tensor((tensor/X_hat, nn_factors), transpose_factors= True)
+            if masked:
+                E = M
+            else:
+                E = np.ones_like(tensor)
+            denominator = tucker_to_tensor((E, nn_factors), transpose_factors= True)
+            denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+        else: #haven't "masked" this.
+            numerator = tucker_to_tensor((tensor, nn_factors), transpose_factors=True)
+            numerator = tl.clip(numerator, a_min=epsilon, a_max=None)
+            for i, f in enumerate(nn_factors):
+                if i:
+                    denominator = mode_dot(denominator, tl.dot(tl.transpose(f), f), i)
+                else:
+                    denominator = mode_dot(nn_core, tl.dot(tl.transpose(f), f), i)
+            denominator = tl.clip(denominator, a_min=epsilon, a_max=None)
+        
+        mul_update = numerator / denominator
+        nn_core *= numerator / denominator
+        update_errors.append(KL_D(tensor, nn_core, nn_factors))
+        
+        if symmetric and iteration %50 ==0 and verbose:
+            print('It is {} that mul_update[0] is symmetric at iteration {}'.format(np.allclose(mul_update[0], mul_update[0].T), iteration))
+            print('And it is {} that core[0] is symmetric at iteration {}'.format(np.allclose(nn_core[0], nn_core[0].T), iteration))
+        
+        if return_fact_it:
+            facts.append((copy.deepcopy(nn_core), copy.deepcopy(nn_factors)))
+        if loss == 'KL':
+            if not masked:
+                rec_errors.append(KL_D(tensor, nn_core, nn_factors))
+            else:
+                rec_errors.append(KL_D(tensor, nn_core, nn_factors, masked, M))
+        else:
+            rec_error = tl.norm(tensor - tucker_to_tensor((nn_core, nn_factors)), 2) / norm_tensor
+            rec_errors.append(rec_error)
+            
+        if not masked:
+            EM_errors.append(max_like(tensor, nn_core, nn_factors))  
+        else:
+            EM_errors.append(max_like(tensor, nn_core, nn_factors, masked, M))
+            
+        if rec_errors[-1] < nn_min_KL:
+            nn_min_core = copy.deepcopy(nn_core)
+            nn_min_factors = copy.deepcopy(nn_factors)
+            nn_min_KL = rec_errors[-1]
+            nn_min_index = len(rec_errors)-1
+            
+        if iteration % 50 ==0 and verbose:
+            print('iteration {}: {} loss = {}, variation = {}.'.format(iteration, loss,
+                rec_errors[-1], rec_errors[-2] - rec_errors[-1]))
+            
+#         if iteration > 0 and rec_errors[-1]>rec_errors[-2]:
+#             if np.any(nn_core < 0):
+#                 print("core tensor is negative")
+#             if np.any(nn_factors[0]<0):
+#                 print("Y is negative")
+#             if np.any(nn_factors[1]<0):
+#                 print("U is negative")
+#             if np.any(nn_factors[2]<0):
+#                 print("V is negative")
+#             print("ERROR: Loss increasing at iteration ", iteration)
+        
+        if not MT_stopping_conditions:
+            if iteration > 1 and abs(rec_errors[-2] - rec_errors[-1])/abs(rec_errors[-1]) < tol:
+                if verbose:
+                    print('converged in {} iterations. {} loss = {}'.format(iteration, loss, rec_errors[-1]))
+                break
+        else: 
+            if iteration > 1 and abs(EM_errors[-2] - EM_errors[-1])/abs(EM_errors[-1]) < tol:
+                EM_count += 1
+                if EM_count == 20:
+                    if verbose:
+                        print('converged in {} iterations. {} loss = {}'.format(iteration, loss, rec_errors[-1]))
+                        print('maximum likelihood = {}'.format(EM_errors[-1]))
+                    break
+                    
+    if not returnErrors:
+        return TuckerTensor((nn_min_core, nn_min_factors))
+    else:
+        if return_fact_it:
+            return TuckerTensor((nn_min_core, nn_min_factors)), EM_errors, rec_errors, update_errors, nn_min_index, facts
+        else:
+            return TuckerTensor((nn_min_core, nn_min_factors)), EM_errors, rec_errors, update_errors, nn_min_index
