@@ -8,6 +8,6 @@ The code depends on the following packages and the version number for which it i
 
 Any additional tools which may not be descibed here are described in [the github page](https://github.com/izabelaguiar/NNTuck) for [_A factor model of multilayer network interdependence_ (Aguiar, Taylor, Ugander, 2022).](https://arxiv.org/abs/2206.01804)
 
-If you use this code, please cite _The latent cognitive structures of social networks_ by Izabel Aguiar and Johan Ugander (2023) and/or [_A factor model of multilayer network interdependence_ (Aguiar, Taylor, Ugander, 2022).](https://arxiv.org/abs/2206.01804).
+If you use this code, please cite _The latent cognitive structures of social networks_ (Aguiar and Ugander, 2023) and/or [_A factor model of multilayer network interdependence_ (Aguiar, Taylor, Ugander, 2022).](https://arxiv.org/abs/2206.01804).
 
 If you  have any questions about this code repository or the work in general, please email me at `izzya@stanford.edu`!
